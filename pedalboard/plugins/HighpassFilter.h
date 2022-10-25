@@ -24,16 +24,20 @@ namespace py = pybind11;
 
 namespace Pedalboard {
 template <typename SampleType>
-class HighpassFilter : public JucePlugin<juce::dsp::IIR::Filter<SampleType>> {
+class HighpassFilter : public JucePlugin<juce::dsp::ProcessorDuplicator<
+                           juce::dsp::IIR::Filter<SampleType>,
+                           juce::dsp::IIR::Coefficients<SampleType>>> {
 public:
   void setCutoffFrequencyHz(float f) noexcept { cutoffFrequencyHz = f; }
   float getCutoffFrequencyHz() const noexcept { return cutoffFrequencyHz; }
 
   virtual void prepare(const juce::dsp::ProcessSpec &spec) override {
-    JucePlugin<juce::dsp::IIR::Filter<SampleType>>::prepare(spec);
-    this->getDSP().coefficients =
-        juce::dsp::IIR::Coefficients<SampleType>::makeFirstOrderHighPass(
+    *this->getDSP().state =
+        *juce::dsp::IIR::Coefficients<SampleType>::makeFirstOrderHighPass(
             spec.sampleRate, cutoffFrequencyHz);
+    JucePlugin<juce::dsp::ProcessorDuplicator<
+        juce::dsp::IIR::Filter<SampleType>,
+        juce::dsp::IIR::Coefficients<SampleType>>>::prepare(spec);
   }
 
 private:
@@ -41,13 +45,15 @@ private:
 };
 
 inline void init_highpass(py::module &m) {
-  py::class_<HighpassFilter<float>, Plugin>(
+  py::class_<HighpassFilter<float>, Plugin,
+             std::shared_ptr<HighpassFilter<float>>>(
       m, "HighpassFilter",
       "Apply a first-order high-pass filter with a roll-off of 6dB/octave. "
-      "The cutoff frequency will be attenuated by -3dB (i.e.: 0.707x as "
-      "loud).")
+      "The cutoff frequency will be attenuated by -3dB (i.e.: "
+      R"(:math:`\\frac{1}{\\sqrt{2}}` as loud, expressed as a gain factor))"
+      " and lower frequencies will be attenuated by a further 6dB per octave.)")
       .def(py::init([](float cutoff_frequency_hz) {
-             auto plugin = new HighpassFilter<float>();
+             auto plugin = std::make_unique<HighpassFilter<float>>();
              plugin->setCutoffFrequencyHz(cutoff_frequency_hz);
              return plugin;
            }),

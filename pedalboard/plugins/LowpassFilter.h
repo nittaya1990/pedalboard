@@ -24,16 +24,20 @@ namespace py = pybind11;
 
 namespace Pedalboard {
 template <typename SampleType>
-class LowpassFilter : public JucePlugin<juce::dsp::IIR::Filter<SampleType>> {
+class LowpassFilter : public JucePlugin<juce::dsp::ProcessorDuplicator<
+                          juce::dsp::IIR::Filter<SampleType>,
+                          juce::dsp::IIR::Coefficients<SampleType>>> {
 public:
   void setCutoffFrequencyHz(float f) noexcept { cutoffFrequencyHz = f; }
   float getCutoffFrequencyHz() const noexcept { return cutoffFrequencyHz; }
 
   virtual void prepare(const juce::dsp::ProcessSpec &spec) override {
-    JucePlugin<juce::dsp::IIR::Filter<SampleType>>::prepare(spec);
-    this->getDSP().coefficients =
-        juce::dsp::IIR::Coefficients<SampleType>::makeFirstOrderLowPass(
+    *this->getDSP().state =
+        *juce::dsp::IIR::Coefficients<SampleType>::makeFirstOrderLowPass(
             spec.sampleRate, cutoffFrequencyHz);
+    JucePlugin<juce::dsp::ProcessorDuplicator<
+        juce::dsp::IIR::Filter<SampleType>,
+        juce::dsp::IIR::Coefficients<SampleType>>>::prepare(spec);
   }
 
 private:
@@ -41,13 +45,14 @@ private:
 };
 
 inline void init_lowpass(py::module &m) {
-  py::class_<LowpassFilter<float>, Plugin>(
+  py::class_<LowpassFilter<float>, Plugin,
+             std::shared_ptr<LowpassFilter<float>>>(
       m, "LowpassFilter",
       "Apply a first-order low-pass filter with a roll-off of 6dB/octave. "
       "The cutoff frequency will be attenuated by -3dB (i.e.: 0.707x as "
       "loud).")
       .def(py::init([](float cutoff_frequency_hz) {
-             auto plugin = new LowpassFilter<float>();
+             auto plugin = std::make_unique<LowpassFilter<float>>();
              plugin->setCutoffFrequencyHz(cutoff_frequency_hz);
              return plugin;
            }),

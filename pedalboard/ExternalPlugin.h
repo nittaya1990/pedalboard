@@ -25,8 +25,13 @@
 #include <sys/utsname.h>
 #endif
 
+#include "AudioUnitParser.h"
 #include "Plugin.h"
 #include <pybind11/stl.h>
+
+#if JUCE_MAC
+#include <AudioToolbox/AudioUnitUtilities.h>
+#endif
 
 namespace Pedalboard {
 
@@ -34,6 +39,11 @@ namespace Pedalboard {
 // to play nicely with the Python interpreter.
 static std::mutex EXTERNAL_PLUGIN_MUTEX;
 static int NUM_ACTIVE_EXTERNAL_PLUGINS = 0;
+
+static const std::string AUDIO_UNIT_NOT_INSTALLED_ERROR =
+    "macOS requires plugin files to be moved to "
+    "/Library/Audio/Plug-Ins/Components/ or "
+    "~/Library/Audio/Plug-Ins/Components/ before loading.";
 
 inline std::vector<std::string> findInstalledVSTPluginPaths() {
   // Ensure we have a MessageManager, which is required by the VST wrapper
@@ -110,6 +120,130 @@ private:
 };
 #endif
 
+static bool audioUnitIsInstalled(const juce::String audioUnitFilePath) {
+  return audioUnitFilePath.contains("/Library/Audio/Plug-Ins/Components/");
+}
+
+template <typename ExternalPluginType>
+static std::vector<std::string> getPluginNamesForFile(std::string filename) {
+  juce::MessageManager::getInstance();
+
+  ExternalPluginType format;
+  juce::OwnedArray<juce::PluginDescription> typesFound;
+
+  std::string errorMessage = "Unable to scan plugin " + filename +
+                             ": unsupported plugin format or scan failure.";
+
+#if JUCE_PLUGINHOST_AU && JUCE_MAC
+  if constexpr (std::is_same<ExternalPluginType,
+                             juce::AudioUnitPluginFormat>::value) {
+    auto identifiers = getAudioUnitIdentifiersFromFile(filename);
+    // For each plugin in the identified bundle, scan using its AU identifier:
+    for (int i = 0; i < identifiers.size(); i++) {
+      format.findAllTypesForFile(typesFound, identifiers[i]);
+    }
+
+    if (typesFound.isEmpty() && !audioUnitIsInstalled(filename)) {
+      errorMessage += " " + AUDIO_UNIT_NOT_INSTALLED_ERROR;
+    }
+  } else {
+    format.findAllTypesForFile(typesFound, filename);
+  }
+#else
+  format.findAllTypesForFile(typesFound, filename);
+#endif
+
+  if (typesFound.isEmpty()) {
+    throw pybind11::import_error(errorMessage);
+  }
+
+  std::vector<std::string> pluginNames;
+  for (int i = 0; i < typesFound.size(); i++) {
+    pluginNames.push_back(typesFound[i]->name.toStdString());
+  }
+  return pluginNames;
+}
+
+class StandalonePluginWindow : public juce::DocumentWindow {
+public:
+  StandalonePluginWindow(juce::AudioProcessor &processor)
+      : DocumentWindow("Pedalboard",
+                       juce::LookAndFeel::getDefaultLookAndFeel().findColour(
+                           juce::ResizableWindow::backgroundColourId),
+                       juce::DocumentWindow::minimiseButton |
+                           juce::DocumentWindow::closeButton),
+        processor(processor) {
+    setUsingNativeTitleBar(true);
+
+    if (processor.hasEditor()) {
+      if (auto *editor = processor.createEditorIfNeeded()) {
+        setContentOwned(editor, true);
+        setResizable(editor->isResizable(), false);
+      } else {
+        throw std::runtime_error("Failed to create plugin editor UI.");
+      }
+    } else {
+      throw std::runtime_error("Plugin has no available editor UI.");
+    }
+  }
+
+  /**
+   * Open a native window to show a given AudioProcessor's editor UI,
+   * pumping the juce::MessageManager run loop as necessary to service
+   * UI events.
+   */
+  static void openWindowAndWait(juce::AudioProcessor &processor) {
+    bool shouldThrowErrorAlreadySet = false;
+
+    JUCE_AUTORELEASEPOOL {
+      StandalonePluginWindow window(processor);
+      window.show();
+
+      // Run in a tight loop so that we don't have to call ->stopDispatchLoop(),
+      // which causes the MessageManager to become unusable in the future.
+      // The window can be closed by sending a KeyboardInterrupt or closing
+      // the window in the UI.
+      while (window.isVisible()) {
+        if (PyErr_CheckSignals() != 0) {
+          window.closeButtonPressed();
+          shouldThrowErrorAlreadySet = true;
+          break;
+        }
+
+        {
+          // Release the GIL to allow other Python threads to run in the
+          // background while we the UI is running:
+          py::gil_scoped_release release;
+          juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        }
+      }
+    }
+
+    // Once the Autorelease pool has been drained, pump the dispatch loop one
+    // more time to process any window close events:
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+
+    if (shouldThrowErrorAlreadySet) {
+      throw py::error_already_set();
+    }
+  }
+
+  void closeButtonPressed() override { setVisible(false); }
+
+  ~StandalonePluginWindow() override { clearContentComponent(); }
+
+  void show() {
+    setVisible(true);
+    toFront(true);
+    juce::Process::makeForegroundProcess();
+  }
+
+private:
+  juce::AudioProcessor &processor;
+
+  JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StandalonePluginWindow)
+};
+
 enum class ExternalPluginReloadType {
   /**
    * Unknown: we need to determine the reload type.
@@ -135,20 +269,17 @@ enum class ExternalPluginReloadType {
 
 template <typename ExternalPluginType> class ExternalPlugin : public Plugin {
 public:
-  ExternalPlugin(std::string &_pathToPluginFile)
+  ExternalPlugin(std::string &_pathToPluginFile,
+                 std::optional<std::string> pluginName = {})
       : pathToPluginFile(_pathToPluginFile) {
     py::gil_scoped_release release;
     // Ensure we have a MessageManager, which is required by the VST wrapper
     // Without this, we get an assert(false) from JUCE at runtime
     juce::MessageManager::getInstance();
 
-    juce::KnownPluginList pluginList;
-
     juce::OwnedArray<juce::PluginDescription> typesFound;
     ExternalPluginType format;
 
-    juce::String pluginLoadError =
-        "Plugin not found or not in the appropriate format.";
     pluginFormatManager.addDefaultFormats();
 
     auto pluginFileStripped =
@@ -162,12 +293,66 @@ public:
                                    ": plugin file not found.");
     }
 
-    pluginList.scanAndAddFile(pluginFileStripped, false, typesFound, format);
+#if JUCE_PLUGINHOST_AU && JUCE_MAC
+    if constexpr (std::is_same<ExternalPluginType,
+                               juce::AudioUnitPluginFormat>::value) {
+      auto identifiers = getAudioUnitIdentifiersFromFile(pluginFileStripped);
+      // For each plugin in the identified bundle, scan using its AU identifier:
+      for (int i = 0; i < identifiers.size(); i++) {
+        format.findAllTypesForFile(typesFound, identifiers[i]);
+      }
+    } else {
+      format.findAllTypesForFile(typesFound, pluginFileStripped);
+    }
+#else
+    format.findAllTypesForFile(typesFound, pluginFileStripped);
+#endif
 
     if (!typesFound.isEmpty()) {
-      foundPluginDescription = *typesFound[0];
+      if (typesFound.size() == 1) {
+        foundPluginDescription = *typesFound[0];
+      } else if (typesFound.size() > 1) {
+        std::string errorMessage =
+            "Plugin file " + pathToPluginFile.toStdString() + " contains " +
+            std::to_string(typesFound.size()) + " plugins";
+
+        // Use the provided plugin name to disambiguate:
+        if (pluginName) {
+          for (int i = 0; i < typesFound.size(); i++) {
+            if (typesFound[i]->name.toStdString() == *pluginName) {
+              foundPluginDescription = *typesFound[i];
+              break;
+            }
+          }
+
+          if (foundPluginDescription.name.isEmpty()) {
+            errorMessage += ", and the provided plugin_name \"" + *pluginName +
+                            "\" matched no plugins. ";
+          }
+        } else {
+          errorMessage += ". ";
+        }
+
+        if (foundPluginDescription.name.isEmpty()) {
+          juce::StringArray pluginNames;
+          for (int i = 0; i < typesFound.size(); i++) {
+            pluginNames.add(typesFound[i]->name);
+          }
+
+          errorMessage +=
+              ("To open a specific plugin within this file, pass a "
+               "\"plugin_name\" parameter with one of the following "
+               "values:\n\t\"" +
+               pluginNames.joinIntoString("\"\n\t\"").toStdString() + "\"");
+          throw std::domain_error(errorMessage);
+        }
+      }
+
       reinstantiatePlugin();
     } else {
+      std::string errorMessage = "Unable to load plugin " +
+                                 pathToPluginFile.toStdString() +
+                                 ": unsupported plugin format or load failure.";
 #if JUCE_LINUX
       auto machineName = []() -> juce::String {
         struct utsname unameData;
@@ -186,17 +371,20 @@ public:
               .getChildFile(machineName + "-linux")
               .getChildFile(pluginBundle.getFileNameWithoutExtension() + ".so");
 
-      throw pybind11::import_error(
-          "Unable to load plugin " + pathToPluginFile.toStdString() +
-          ": unsupported plugin format or load failure. Plugin files or " +
-          "shared library dependencies may be missing. (Try running `ldd \"" +
-          pathToSharedObjectFile.getFullPathName().toStdString() + "\"` to " +
-          "see which dependencies might be missing.).");
-#else
-      throw pybind11::import_error(
-          "Unable to load plugin " + pathToPluginFile.toStdString() +
-          ": unsupported plugin format or load failure.");
+      errorMessage += " Plugin files or shared library dependencies may be "
+                      "missing. (Try running `ldd \"" +
+                      pathToSharedObjectFile.getFullPathName().toStdString() +
+                      "\"` to see which dependencies might be missing.).";
+#elif JUCE_PLUGINHOST_AU && JUCE_MAC
+      if constexpr (std::is_same<ExternalPluginType,
+                                 juce::AudioUnitPluginFormat>::value) {
+        if (!audioUnitIsInstalled(pathToPluginFile)) {
+          errorMessage += " " + AUDIO_UNIT_NOT_INSTALLED_ERROR;
+        }
+      }
 #endif
+
+      throw pybind11::import_error(errorMessage);
     }
   }
 
@@ -213,8 +401,38 @@ public:
     }
   }
 
+  struct PresetVisitor : public juce::ExtensionsVisitor {
+    const std::string presetFilePath;
+
+    PresetVisitor(const std::string presetFilePath)
+        : presetFilePath(presetFilePath) {}
+
+    void visitVST3Client(
+        const juce::ExtensionsVisitor::VST3Client &client) override {
+      juce::File presetFile(presetFilePath);
+      juce::MemoryBlock presetData;
+
+      if (!presetFile.loadFileAsData(presetData)) {
+        throw std::runtime_error("Failed to read preset file: " +
+                                 presetFilePath);
+      }
+
+      if (!client.setPreset(presetData)) {
+        throw std::runtime_error(
+            "Plugin returned an error when loading data from preset file: " +
+            presetFilePath);
+      }
+    }
+  };
+
+  void loadPresetData(std::string presetFilePath) {
+    PresetVisitor visitor{presetFilePath};
+    pluginInstance->getExtensions(visitor);
+  }
+
   void reinstantiatePlugin() {
-    // If we have an existing plugin, save its state and reload its state later:
+    // If we have an existing plugin, save its state and reload its state
+    // later:
     juce::MemoryBlock savedState;
     std::map<int, float> currentParameters;
 
@@ -247,17 +465,10 @@ public:
                                      loadError.toStdString());
       }
 
+      pluginInstance->enableAllBuses();
+
       auto mainInputBus = pluginInstance->getBus(true, 0);
       auto mainOutputBus = pluginInstance->getBus(false, 0);
-
-      if (!mainInputBus) {
-        auto exception = std::invalid_argument(
-            "Plugin '" + pluginInstance->getName().toStdString() +
-            "' does not accept audio input. It may be an instrument plug-in "
-            "and not an audio effect processor.");
-        pluginInstance.reset();
-        throw exception;
-      }
 
       if (!mainOutputBus) {
         auto exception = std::invalid_argument(
@@ -290,9 +501,9 @@ public:
     pluginInstance->setStateInformation(savedState.getData(),
                                         savedState.getSize());
 
-    // Set all of the parameters twice: we may have meta-parameters that change
-    // the validity of other `setValue` calls. (i.e.: param1 can't be set until
-    // param2 is set.)
+    // Set all of the parameters twice: we may have meta-parameters that
+    // change the validity of other `setValue` calls. (i.e.: param1 can't be
+    // set until param2 is set.)
     for (int i = 0; i < 2; i++) {
       for (auto *parameter : pluginInstance->getParameters()) {
         if (currentParameters.count(parameter->getParameterIndex()) > 0) {
@@ -319,8 +530,6 @@ public:
     if (numChannels == 0)
       return;
 
-    pluginInstance->disableNonMainBuses();
-
     auto mainInputBus = pluginInstance->getBus(true, 0);
     auto mainOutputBus = pluginInstance->getBus(false, 0);
 
@@ -331,14 +540,18 @@ public:
           "and not an audio effect processor.");
     }
 
-    // Disable all other input buses to avoid crashing:
+    // Try to disable all non-main input buses if possible:
     for (int i = 1; i < pluginInstance->getBusCount(true); i++) {
-      pluginInstance->getBus(true, i)->enable(false);
+      auto *bus = pluginInstance->getBus(true, i);
+      if (bus->isNumberOfChannelsSupported(0))
+        bus->enable(false);
     }
 
-    // ...and all other output buses too:
+    // ...and all non-main output buses too:
     for (int i = 1; i < pluginInstance->getBusCount(false); i++) {
-      pluginInstance->getBus(false, i)->enable(false);
+      auto *bus = pluginInstance->getBus(false, i);
+      if (bus->isNumberOfChannelsSupported(0))
+        bus->enable(false);
     }
 
     if (mainInputBus->getNumberOfChannels() == numChannels &&
@@ -501,6 +714,7 @@ public:
 
       // Force prepare() to be called again later by invalidating lastSpec:
       lastSpec.maximumBlockSize = 0;
+      samplesProvided = 0;
     }
   }
 
@@ -517,7 +731,8 @@ public:
         lastSpec.maximumBlockSize < spec.maximumBlockSize ||
         lastSpec.numChannels != spec.numChannels) {
 
-      // Changing the number of channels requires releaseResources to be called:
+      // Changing the number of channels requires releaseResources to be
+      // called:
       if (lastSpec.numChannels != spec.numChannels) {
         pluginInstance->releaseResources();
         setNumChannels(spec.numChannels);
@@ -530,8 +745,8 @@ public:
     }
   }
 
-  void
-  process(const juce::dsp::ProcessContextReplacing<float> &context) override {
+  int process(
+      const juce::dsp::ProcessContextReplacing<float> &context) override {
 
     if (pluginInstance) {
       juce::MidiBuffer emptyMidiBuffer;
@@ -567,18 +782,8 @@ public:
             "number of channels passed in.)");
       }
 
-      size_t pluginBufferChannelCount = 0;
-      // Iterate through all input busses and add their input channels to our
-      // buffer:
-      for (size_t i = 0;
-           i < static_cast<size_t>(pluginInstance->getBusCount(true)); i++) {
-        if (pluginInstance->getBus(true, i)->isEnabled()) {
-          pluginBufferChannelCount +=
-              pluginInstance->getBus(true, i)->getNumberOfChannels();
-        }
-      }
-
-      std::vector<float *> channelPointers(pluginBufferChannelCount);
+      std::vector<float *> channelPointers(
+          pluginInstance->getTotalNumInputChannels());
 
       for (size_t i = 0; i < outputBlock.getNumChannels(); i++) {
         channelPointers[i] = outputBlock.getChannelPointer(i);
@@ -588,8 +793,8 @@ public:
       // plugin that we don't use. Use vector here to ensure the memory is
       // freed via RAII.
       std::vector<std::vector<float>> dummyChannels;
-      for (size_t i = outputBlock.getNumChannels();
-           i < pluginBufferChannelCount; i++) {
+      for (size_t i = outputBlock.getNumChannels(); i < channelPointers.size();
+           i++) {
         std::vector<float> dummyChannel(outputBlock.getNumSamples());
         channelPointers[i] = dummyChannel.data();
         dummyChannels.push_back(dummyChannel);
@@ -598,10 +803,21 @@ public:
       // Create an audio buffer that doesn't actually allocate anything, but
       // just points to the data in the ProcessContext.
       juce::AudioBuffer<float> audioBuffer(channelPointers.data(),
-                                           pluginBufferChannelCount,
+                                           channelPointers.size(),
                                            outputBlock.getNumSamples());
+
       pluginInstance->processBlock(audioBuffer, emptyMidiBuffer);
+      samplesProvided += outputBlock.getNumSamples();
+
+      // To compensate for any latency added by the plugin,
+      // only tell Pedalboard to use the last _n_ samples.
+      long usableSamplesProduced =
+          std::max(0L, samplesProvided - pluginInstance->getLatencySamples());
+      return static_cast<int>(
+          std::min(usableSamplesProduced, (long)outputBlock.getNumSamples()));
     }
+
+    return 0;
   }
 
   std::vector<juce::AudioProcessorParameter *> getParameters() const {
@@ -621,6 +837,32 @@ public:
     return nullptr;
   }
 
+  virtual int getLatencyHint() override {
+    if (!pluginInstance)
+      return 0;
+    return pluginInstance->getLatencySamples();
+  }
+
+  void showEditor() {
+    if (!pluginInstance) {
+      throw std::runtime_error(
+          "Editor cannot be shown - plugin not loaded. This is an internal "
+          "Pedalboard error and should be reported.");
+    }
+
+    if (!juce::Desktop::getInstance().getDisplays().getPrimaryDisplay()) {
+      throw std::runtime_error(
+          "Editor cannot be shown - no visual display devices available.");
+    }
+
+    if (!juce::MessageManager::getInstance()->isThisTheMessageThread()) {
+      throw std::runtime_error(
+          "Plugin UI windows can only be shown from the main thread.");
+    }
+
+    StandalonePluginWindow::openWindowAndWait(*pluginInstance);
+  }
+
 private:
   constexpr static int ExternalLoadSampleRate = 44100,
                        ExternalLoadMaximumBlockSize = 8192;
@@ -628,6 +870,8 @@ private:
   juce::PluginDescription foundPluginDescription;
   juce::AudioPluginFormatManager pluginFormatManager;
   std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
+
+  long samplesProvided = 0;
 
   ExternalPluginReloadType reloadType = ExternalPluginReloadType::Unknown;
 };
@@ -713,7 +957,8 @@ inline void init_external_plugins(py::module &m) {
           },
           py::arg("string_value"),
           "Returns the raw value of the supplied text. Plugins may handle "
-          "errors however they see fit, but will likely not raise exceptions.")
+          "errors however they see fit, but will likely not raise "
+          "exceptions.")
       .def_property_readonly(
           "is_orientation_inverted",
           &juce::AudioProcessorParameter::isOrientationInverted,
@@ -722,10 +967,11 @@ inline void init_external_plugins(py::module &m) {
       .def_property_readonly("is_automatable",
                              &juce::AudioProcessorParameter::isAutomatable,
                              "Returns true if this parameter can be automated.")
-      .def_property_readonly(
-          "is_automatable", &juce::AudioProcessorParameter::isAutomatable,
-          "Returns true if this parameter can be automated (i.e.: scheduled to "
-          "change over time, in real-time, in a DAW).")
+      .def_property_readonly("is_automatable",
+                             &juce::AudioProcessorParameter::isAutomatable,
+                             "Returns true if this parameter can be "
+                             "automated (i.e.: scheduled to "
+                             "change over time, in real-time, in a DAW).")
       .def_property_readonly(
           "is_meta_parameter", &juce::AudioProcessorParameter::isMetaParameter,
           "A meta-parameter is a parameter that changes other parameters.")
@@ -740,18 +986,19 @@ inline void init_external_plugins(py::module &m) {
           "Returns the current value of the parameter as a string.");
 
 #if JUCE_PLUGINHOST_VST3 && (JUCE_MAC || JUCE_WINDOWS || JUCE_LINUX)
-  py::class_<ExternalPlugin<juce::VST3PluginFormat>, Plugin>(
+  py::class_<ExternalPlugin<juce::VST3PluginFormat>, Plugin,
+             std::shared_ptr<ExternalPlugin<juce::VST3PluginFormat>>>(
       m, "_VST3Plugin",
       "A wrapper around any Steinberg® VST3 audio effect plugin. Note that "
       "plugins must already support the operating system currently in use "
       "(i.e.: if you're running Linux but trying to open a VST that does not "
-      "support Linux, this will fail).",
-      py::dynamic_attr())
-      .def(py::init([](std::string &pathToPluginFile) {
-             return new ExternalPlugin<juce::VST3PluginFormat>(
-                 pathToPluginFile);
+      "support Linux, this will fail).")
+      .def(py::init([](std::string &pathToPluginFile,
+                       std::optional<std::string> pluginName) {
+             return std::make_unique<ExternalPlugin<juce::VST3PluginFormat>>(
+                 pathToPluginFile, pluginName);
            }),
-           py::arg("path_to_plugin_file"))
+           py::arg("path_to_plugin_file"), py::arg("plugin_name") = py::none())
       .def("__repr__",
            [](ExternalPlugin<juce::VST3PluginFormat> &plugin) {
              std::ostringstream ss;
@@ -761,6 +1008,18 @@ inline void init_external_plugins(py::module &m) {
              ss << ">";
              return ss.str();
            })
+      .def("load_preset",
+           &ExternalPlugin<juce::VST3PluginFormat>::loadPresetData,
+           "Load a VST3 preset file in .vstpreset format.",
+           py::arg("preset_file_path"))
+      .def_static(
+          "get_plugin_names_for_file",
+          [](std::string filename) {
+            return getPluginNamesForFile<juce::VST3PluginFormat>(filename);
+          },
+          "Return a list of plugin names contained within a given VST3 "
+          "plugin (i.e.: a \".vst3\"). If the provided file cannot be scanned, "
+          "an ImportError will be raised.")
       .def_property_readonly_static(
           "installed_plugins",
           [](py::object /* cls */) { return findInstalledVSTPluginPaths(); },
@@ -769,24 +1028,36 @@ inline void init_external_plugins(py::module &m) {
           "plugins in this list are not guaranteed to be compatible with "
           "Pedalboard.")
       .def_property_readonly(
+          "name",
+          [](ExternalPlugin<juce::VST3PluginFormat> &plugin) {
+            return plugin.getName().toStdString();
+          },
+          "The name of this plugin.")
+      .def_property_readonly(
           "_parameters", &ExternalPlugin<juce::VST3PluginFormat>::getParameters,
           py::return_value_policy::reference_internal)
       .def("_get_parameter",
            &ExternalPlugin<juce::VST3PluginFormat>::getParameter,
-           py::return_value_policy::reference_internal);
+           py::return_value_policy::reference_internal)
+      .def("show_editor", &ExternalPlugin<juce::VST3PluginFormat>::showEditor,
+           "Show the UI of this plugin as a native window. This method will "
+           "block until the window is closed or a KeyboardInterrupt is "
+           "received.");
 #endif
 
 #if JUCE_PLUGINHOST_AU && JUCE_MAC
-  py::class_<ExternalPlugin<juce::AudioUnitPluginFormat>, Plugin>(
+  py::class_<ExternalPlugin<juce::AudioUnitPluginFormat>, Plugin,
+             std::shared_ptr<ExternalPlugin<juce::AudioUnitPluginFormat>>>(
       m, "_AudioUnitPlugin",
       "A wrapper around any Apple Audio Unit audio effect plugin. Only "
-      "available on macOS.",
-      py::dynamic_attr())
-      .def(py::init([](std::string &pathToPluginFile) {
-             return new ExternalPlugin<juce::AudioUnitPluginFormat>(
-                 pathToPluginFile);
+      "available on macOS.")
+      .def(py::init([](std::string &pathToPluginFile,
+                       std::optional<std::string> pluginName) {
+             return std::make_unique<
+                 ExternalPlugin<juce::AudioUnitPluginFormat>>(pathToPluginFile,
+                                                              pluginName);
            }),
-           py::arg("path_to_plugin_file"))
+           py::arg("path_to_plugin_file"), py::arg("plugin_name") = py::none())
       .def("__repr__",
            [](const ExternalPlugin<juce::AudioUnitPluginFormat> &plugin) {
              std::ostringstream ss;
@@ -796,6 +1067,19 @@ inline void init_external_plugins(py::module &m) {
              ss << ">";
              return ss.str();
            })
+      .def_static(
+          "get_plugin_names_for_file",
+          [](std::string filename) {
+            return getPluginNamesForFile<juce::AudioUnitPluginFormat>(filename);
+          },
+          py::arg("filename"),
+          "Return a list of plugin names contained within a given Audio Unit "
+          "bundle (i.e.: a ``.component`` file). If the provided file cannot "
+          "be "
+          "scanned, an ``ImportError`` will be raised.\n\nNote that most Audio "
+          "Units have a single plugin inside, but this method can be useful to "
+          "determine if multiple plugins are present in one bundle, and if so, "
+          "what their names are.")
       .def_property_readonly_static(
           "installed_plugins",
           [](py::object /* cls */) {
@@ -806,12 +1090,23 @@ inline void init_external_plugins(py::module &m) {
           "plugins in this list are not guaranteed to be compatible with "
           "Pedalboard.")
       .def_property_readonly(
+          "name",
+          [](ExternalPlugin<juce::AudioUnitPluginFormat> &plugin) {
+            return plugin.getName().toStdString();
+          },
+          "The name of this plugin, as reported by the plugin itself.")
+      .def_property_readonly(
           "_parameters",
           &ExternalPlugin<juce::AudioUnitPluginFormat>::getParameters,
           py::return_value_policy::reference_internal)
       .def("_get_parameter",
            &ExternalPlugin<juce::AudioUnitPluginFormat>::getParameter,
-           py::return_value_policy::reference_internal);
+           py::return_value_policy::reference_internal)
+      .def("show_editor",
+           &ExternalPlugin<juce::AudioUnitPluginFormat>::showEditor,
+           "Show the UI of this plugin as a native window. This method will "
+           "block until the window is closed or a KeyboardInterrupt is "
+           "received.");
 #endif
 }
 
